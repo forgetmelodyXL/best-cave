@@ -236,12 +236,13 @@ function getImageSize(buffer: Buffer): { width: number, height: number } | null 
  * @param url 图片链接。
  * @returns 图片宽高，失败时返回 null。
  */
-async function getImageSizeFromUrl(session: Session, url: string): Promise<{ width: number, height: number } | null> {
+async function getImageSizeFromUrl(session: Session, url: string, logger: Logger): Promise<{ width: number, height: number } | null> {
   if (!url.startsWith('http')) return null;
   try {
     const data = await session.bot.ctx.http.get(url, { responseType: 'arraybuffer', timeout: 15000 });
     return getImageSize(Buffer.from(data));
-  } catch {
+  } catch (error) {
+    logger.warn(`从公网 URL 读取图片尺寸失败（${url}）:`, error);
     return null;
   }
 }
@@ -266,18 +267,22 @@ async function uploadQQImage(session: Session, buffer: Buffer, fileName: string)
   const request = bot.internal.http();
   const md5 = crypto.createHash('md5').update(buffer).digest('hex');
   const sha1 = crypto.createHash('sha1').update(buffer).digest('hex');
-  const prepared = await request('/v2/media-images/prepare', {
+  const preparedResponse = await request('/v2/media-images/prepare', {
     method: 'POST',
     data: { file_name: uploadName, file_size: buffer.length, content_type: contentType, md5, sha1 },
   });
+  // bot.internal.http() 返回的是 HTTP 客户端，调用后得到 Response，业务字段在 data 中
+  const prepared = preparedResponse?.data ?? preparedResponse;
   await bot.ctx.http.put(prepared.presigned_url, buffer, { headers: { 'Content-Type': contentType } });
-  const completed = await request('/v2/media-images/complete', {
+  const completedResponse = await request('/v2/media-images/complete', {
     method: 'POST',
     data: { upload_id: prepared.upload_id, md5 },
   });
-  if (!completed?.url) return null;
-  qqImageCache.set(cacheKey, completed.url);
-  return completed.url;
+  const completed = completedResponse?.data ?? completedResponse;
+  const mediaUrl = completed?.url;
+  if (!mediaUrl) return null;
+  qqImageCache.set(cacheKey, mediaUrl);
+  return mediaUrl;
 }
 
 /**
@@ -302,6 +307,7 @@ async function buildQQCaveMarkdown(cave: CaveObject, config: Config, fileManager
     } else if (el.type === 'image') {
       const fileName = el.file;
       if (!fileName) {
+        logger.warn(`回声洞（${cave.id}）中存在缺少文件名的图片`);
         lines.push('[图片]');
         continue;
       }
@@ -319,15 +325,17 @@ async function buildQQCaveMarkdown(cave: CaveObject, config: Config, fileManager
       } else if (buffer) {
         try {
           url = await uploadQQImage(session, buffer, fileName);
+          if (!url) logger.warn(`上传图片 ${fileName} 到 QQ 素材库失败（格式不支持或超过 10MB）`);
         } catch (error) {
           logger.warn(`上传图片 ${fileName} 到 QQ 素材库失败:`, error);
         }
       }
+      const size = buffer ? getImageSize(buffer) : (url ? await getImageSizeFromUrl(session, url, logger) : null);
+      logger.info(`QQ 图片 ${fileName}: buffer=${buffer?.length ?? 0}, url=${url ?? 'null'}, size=${size ? `${size.width}x${size.height}` : 'null'}`);
       if (!url) {
         lines.push('[图片]');
         continue;
       }
-      const size = buffer ? getImageSize(buffer) : await getImageSizeFromUrl(session, url);
       // QQ Markdown 图片必须带实际宽高，移动端才不会显示为占位文本
       if (!size) {
         logger.warn(`无法获取图片 ${fileName} 的尺寸，QQ 端将显示为 [图片]`);
