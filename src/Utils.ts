@@ -1,5 +1,7 @@
 import { Context, h, Logger, Session } from 'koishi';
 import * as path from 'path';
+import * as crypto from 'crypto';
+import Jimp from 'jimp';
 import { CaveObject, Config, StoredElement, ForwardNode } from './index';
 import { FileManager } from './FileManager';
 import { HashManager, CaveHashObject } from './HashManager';
@@ -7,6 +9,50 @@ import { AIManager, CaveMetaObject } from './AIManager';
 import { PendManager } from './PendManager';
 
 const mimeTypeMap = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.mp4': 'video/mp4', '.mp3': 'audio/mpeg', '.webp': 'image/webp' };
+
+/**
+ * @description 根据配置生成回声洞的头部与尾部文本。
+ * @param cave 回声洞对象。
+ * @param config 插件配置。
+ * @param prefix 可选的消息前缀 (e.g., '已删除', '待审核')。
+ * @returns 头部与尾部文本。
+ */
+function resolveCaveHeaderFooter(cave: CaveObject, config: Config, prefix?: string): { header: string, footer: string } {
+  const data = {
+    id: cave.id.toString(),
+    name: cave.userName,
+    user: cave.userId,
+    channel: cave.channelId,
+    time: cave.time.toLocaleString(),
+  };
+  const placeholderRegex = /\{([^}]+)\}/g;
+  const replacer = (match: string, rawContent: string): string => {
+    const isReviewMode = !!prefix;
+    const [normalPart, reviewPart] = rawContent.split('/', 2);
+    const contentToProcess = isReviewMode
+      ? (reviewPart !== undefined ? reviewPart : normalPart)
+      : normalPart;
+    if (!contentToProcess?.trim()) return '';
+    const useMask = contentToProcess.startsWith('*');
+    const key = (useMask ? contentToProcess.substring(1) : contentToProcess).trim();
+    if (!key) return '';
+    const originalValue = data[key];
+    if (originalValue === undefined || originalValue === null) return match;
+    const valueStr = String(originalValue);
+    if (!useMask) return valueStr;
+    const len = valueStr.length;
+    if (len <= 5) return valueStr;
+    let keep = 0;
+    if (len <= 7) keep = 2;
+    else keep = 3;
+    return `${valueStr.substring(0, keep)}***${valueStr.substring(len - keep)}`;
+  };
+  const [rawHeader, rawFooter] = config.caveFormat.split('|', 2);
+  let header = rawHeader ? rawHeader.replace(placeholderRegex, replacer).trim() : '';
+  if (prefix) header = `${prefix}${header}`;
+  const footer = rawFooter ? rawFooter.replace(placeholderRegex, replacer).trim() : '';
+  return { header, footer };
+}
 
 /**
  * @description 构建一条用于发送的完整回声洞消息，处理不同存储后端的资源链接。
@@ -69,39 +115,7 @@ export async function buildCaveMessage(cave: CaveObject, config: Config, fileMan
     })).then(hElements => hElements.flat().filter(Boolean));
   }
   const caveHElements = await transformToH(cave.elements);
-  const data = {
-    id: cave.id.toString(),
-    name: cave.userName,
-    user: cave.userId,
-    channel: cave.channelId,
-    time: cave.time.toLocaleString(),
-  };
-  const placeholderRegex = /\{([^}]+)\}/g;
-  const replacer = (match: string, rawContent: string): string => {
-    const isReviewMode = !!prefix;
-    const [normalPart, reviewPart] = rawContent.split('/', 2);
-    const contentToProcess = isReviewMode
-      ? (reviewPart !== undefined ? reviewPart : normalPart)
-      : normalPart;
-    if (!contentToProcess?.trim()) return '';
-    const useMask = contentToProcess.startsWith('*');
-    const key = (useMask ? contentToProcess.substring(1) : contentToProcess).trim();
-    if (!key) return '';
-    const originalValue = data[key];
-    if (originalValue === undefined || originalValue === null) return match;
-    const valueStr = String(originalValue);
-    if (!useMask) return valueStr;
-    const len = valueStr.length;
-    if (len <= 5) return valueStr;
-    let keep = 0;
-    if (len <= 7) keep = 2;
-    else keep = 3;
-    return `${valueStr.substring(0, keep)}***${valueStr.substring(len - keep)}`;
-  };
-  const [rawHeader, rawFooter] = config.caveFormat.split('|', 2);
-  let header = rawHeader ? rawHeader.replace(placeholderRegex, replacer).trim() : '';
-  if (prefix) header = `${prefix}${header}`;
-  const footer = rawFooter ? rawFooter.replace(placeholderRegex, replacer).trim() : '';
+  const { header, footer } = resolveCaveHeaderFooter(cave, config, prefix);
   const problematicTypes = ['video', 'audio', 'file', 'forward'];
   const placeholderMap = { video: '[视频]', audio: '[音频]', file: '[文件]', forward: '[合并转发]' };
   const containsProblematic = platform === 'onebot' && caveHElements.some(el => problematicTypes.includes(el.type) || (el.type === 'message' && el.attrs.forward));
@@ -128,6 +142,177 @@ export async function buildCaveMessage(cave: CaveObject, config: Config, fileMan
   finalInitialMessage.push(...initialMessageContent);
   if (footer) finalInitialMessage.push('\n' + footer);
   return [finalInitialMessage, ...followUpMessages].filter(msg => msg.length > 0);
+}
+
+const qqImageCache = new Map<string, string>();
+
+const qqImageTypes = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
+
+/**
+ * @description 将图片上传到 QQ 官方机器人素材库，获得可在 Markdown 中引用的链接。
+ * @param session 当前会话。
+ * @param buffer 图片数据。
+ * @param fileName 文件名（扩展名需与图片格式一致）。
+ * @returns Markdown 引用链接，失败时返回 null。
+ */
+async function uploadQQImage(session: Session, buffer: Buffer, fileName: string): Promise<string | null> {
+  const contentType = qqImageTypes[path.extname(fileName).toLowerCase()];
+  if (!contentType || buffer.length > 10 * 1024 * 1024) return null;
+  const cached = qqImageCache.get(`${session.bot.selfId}:${fileName}`);
+  if (cached) return cached;
+  const bot = session.bot as any;
+  const request = bot.internal.http();
+  const md5 = crypto.createHash('md5').update(buffer).digest('hex');
+  const sha1 = crypto.createHash('sha1').update(buffer).digest('hex');
+  const prepared = await request('/v2/media-images/prepare', {
+    method: 'POST',
+    data: { file_name: fileName, file_size: buffer.length, content_type: contentType, md5, sha1 },
+  });
+  await bot.ctx.http.put(prepared.presigned_url, buffer, { headers: { 'Content-Type': contentType } });
+  const completed = await request('/v2/media-images/complete', {
+    method: 'POST',
+    data: { upload_id: prepared.upload_id, md5 },
+  });
+  if (!completed?.url) return null;
+  qqImageCache.set(`${session.bot.selfId}:${fileName}`, completed.url);
+  return completed.url;
+}
+
+/**
+ * @description 读取图片尺寸，失败时返回 null（Markdown 中可省略尺寸）。
+ * @param buffer 图片数据。
+ * @returns 图片宽高。
+ */
+async function getImageSize(buffer: Buffer): Promise<{ width: number, height: number } | null> {
+  try {
+    const image = await Jimp.read(buffer);
+    return { width: image.bitmap.width, height: image.bitmap.height };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @description 为 QQ 官方机器人构建单条 Markdown 消息内容，所有图片以内联语法放在正文中。
+ * @param cave 回声洞对象。
+ * @param config 插件配置。
+ * @param fileManager 文件管理器实例。
+ * @param logger 日志记录器实例。
+ * @param session 当前会话。
+ * @param prefix 可选的消息前缀。
+ * @returns Markdown 文本内容。
+ */
+async function buildQQCaveMarkdown(cave: CaveObject, config: Config, fileManager: FileManager, logger: Logger, session: Session, prefix?: string): Promise<string> {
+  const { header, footer } = resolveCaveHeaderFooter(cave, config, prefix);
+  const lines: string[] = [];
+  if (header) lines.push(header);
+  for (const el of cave.elements) {
+    if (el.type === 'text') {
+      if (el.content) lines.push(el.content as string);
+    } else if (el.type === 'at') {
+      if (!session.isDirect && el.content) lines.push(`<qqbot-at-user id="${el.content}" />`);
+    } else if (el.type === 'image') {
+      const fileName = el.file;
+      if (!fileName) {
+        lines.push('[图片]');
+        continue;
+      }
+      let buffer: Buffer | undefined;
+      try {
+        buffer = await fileManager.readFile(fileName);
+      } catch (error) {
+        logger.warn(`读取图片 ${fileName} 失败:`, error);
+      }
+      let url: string | null = null;
+      if (config.enableS3 && config.publicUrl) {
+        url = new URL(fileName, config.publicUrl).href;
+      } else if (buffer) {
+        try {
+          url = await uploadQQImage(session, buffer, fileName);
+        } catch (error) {
+          logger.warn(`上传图片 ${fileName} 到 QQ 素材库失败:`, error);
+        }
+      }
+      if (!url) {
+        lines.push('[图片]');
+        continue;
+      }
+      const size = buffer ? await getImageSize(buffer) : null;
+      lines.push(size ? `![img #${size.width}px #${size.height}px](${url})` : `![img](${url})`);
+    } else if (el.type === 'video') {
+      lines.push('[视频]');
+    } else if (el.type === 'audio') {
+      lines.push('[音频]');
+    } else if (el.type === 'file') {
+      lines.push('[文件]');
+    } else if (el.type === 'forward') {
+      lines.push('[合并转发]');
+    } else if (el.type === 'face') {
+      lines.push('[表情]');
+    }
+  }
+  if (footer) lines.push(footer);
+  return lines.join('\n');
+}
+
+/**
+ * @description 直接调用 QQ 官方机器人 API 发送带自定义键盘的 Markdown 消息。
+ * @param session 当前会话。
+ * @param content Markdown 文本内容。
+ */
+export async function sendQQCaveMarkdown(session: Session, content: string): Promise<void> {
+  const bot = session.bot as any;
+  const s = session as any;
+  const data: any = {
+    msg_type: 2,
+    markdown: { content: content || ' ' },
+    keyboard: {
+      content: {
+        rows: [{
+          buttons: [{
+            render_data: { label: '再来一个cave', style: 1 },
+            action: { type: 2, permission: { type: 2 }, data: 'cave', enter: true },
+          }],
+        }],
+      },
+    },
+  };
+  const passive = Date.now() - s.timestamp < 5 * 60 * 1000;
+  if (passive && s.messageId) {
+    s.seq = (s.seq || 0) + 1;
+    data.msg_id = s.messageId;
+    data.msg_seq = s.seq;
+  } else if (passive && s.qq?.id) {
+    data.event_id = s.qq.id;
+  }
+  if (s.isDirect) {
+    await bot.internal.sendPrivateMessage(s.channelId, data);
+  } else {
+    await bot.internal.sendMessage(s.channelId, data);
+  }
+}
+
+/**
+ * @description 发送一条回声洞。QQ 平台使用单条 Markdown + 自定义键盘消息，其余平台保持原有逻辑。
+ * @param session 当前会话。
+ * @param cave 回声洞对象。
+ * @param config 插件配置。
+ * @param fileManager 文件管理器实例。
+ * @param logger 日志记录器实例。
+ * @param prefix 可选的消息前缀。
+ */
+export async function sendCave(session: Session, cave: CaveObject, config: Config, fileManager: FileManager, logger: Logger, prefix?: string): Promise<void> {
+  if (session.platform === 'qq') {
+    try {
+      const content = await buildQQCaveMarkdown(cave, config, fileManager, logger, session, prefix);
+      await sendQQCaveMarkdown(session, content);
+      return;
+    } catch (error) {
+      logger.warn(`以 QQ Markdown 发送回声洞（${cave.id}）失败，回退到普通消息:`, error);
+    }
+  }
+  const messages = await buildCaveMessage(cave, config, fileManager, logger, session.platform, prefix);
+  for (const message of messages) if (message.length > 0) await session.send(h.normalize(message));
 }
 
 /**

@@ -261,8 +261,7 @@ export function apply(ctx: Context, config: Config) {
         if (!candidates.length) return `当前${config.perChannel && session.channelId ? '本群' : ''}还没有任何回声洞`;
         const randomId = candidates[Math.floor(Math.random() * candidates.length)].id;
         const [randomCave] = await ctx.database.get('cave', { ...query, id: randomId });
-        const messages = await utils.buildCaveMessage(randomCave, config, fileManager, logger, session.platform);
-        for (const message of messages) if (message.length > 0) await session.send(h.normalize(message));
+        await utils.sendCave(session, randomCave, config, fileManager, logger);
       } catch (error) {
         logger.error('随机获取回声洞失败:', error);
         return '随机获取回声洞失败';
@@ -305,8 +304,7 @@ export function apply(ctx: Context, config: Config) {
         const scopeQuery = config.perChannel && session.channelId ? { status: 'active' as const, channelId: session.channelId } : { status: 'active' as const };
         const [targetCave] = await ctx.database.get('cave', { ...scopeQuery, id });
         if (!targetCave) return `回声洞（${id}）不存在`;
-        const messages = await utils.buildCaveMessage(targetCave, config, fileManager, logger, session.platform);
-        for (const message of messages) if (message.length > 0) await session.send(h.normalize(message));
+        await utils.sendCave(session, targetCave, config, fileManager, logger);
       } catch (error) {
         logger.error(`查看回声洞（${id}）失败:`, error);
         return '查看失败，请稍后再试';
@@ -329,8 +327,9 @@ export function apply(ctx: Context, config: Config) {
         const notes: string[] = [];
         const orderedCaves = processedIds.map(id => cavesToDelete.find(cave => cave.id === id));
         if (orderedCaves.length === 1) {
-          const caveMessages = await utils.buildCaveMessage(orderedCaves[0], config, fileManager, logger, session.platform, '已删除');
-          for (const message of caveMessages) if (message.length > 0) await session.send(h.normalize(message));
+          await utils.sendCave(session, orderedCaves[0], config, fileManager, logger, '已删除');
+        } else if (session.platform === 'qq') {
+          for (const cave of orderedCaves) await utils.sendCave(session, cave, config, fileManager, logger, '已删除');
         } else {
           const groupedMessages = await Promise.all(orderedCaves.map(async cave => {
             const caveMessages = await utils.buildCaveMessage(cave, config, fileManager, logger, session.platform, '已删除');
