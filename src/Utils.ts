@@ -1,7 +1,6 @@
 import { Context, h, Logger, Session } from 'koishi';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import Jimp from 'jimp';
 import { CaveObject, Config, StoredElement, ForwardNode } from './index';
 import { FileManager } from './FileManager';
 import { HashManager, CaveHashObject } from './HashManager';
@@ -149,16 +148,119 @@ const qqImageCache = new Map<string, string>();
 const qqImageTypes = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
 
 /**
+ * @description 根据文件头识别图片真实格式，避免存储文件扩展名与实际内容不一致。
+ * @param buffer 图片数据。
+ * @returns 扩展名与 MIME 类型。
+ */
+function detectImageType(buffer: Buffer): { ext: string, mime: string } | null {
+  if (buffer.length >= 24 && buffer[0] === 0x89 && buffer.toString('ascii', 1, 4) === 'PNG') {
+    return { ext: '.png', mime: 'image/png' };
+  }
+  if (buffer.length >= 10 && buffer.toString('ascii', 0, 3) === 'GIF') {
+    return { ext: '.gif', mime: 'image/gif' };
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) {
+    return { ext: '.jpg', mime: 'image/jpeg' };
+  }
+  if (buffer.length >= 12 && buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') {
+    return { ext: '.webp', mime: 'image/webp' };
+  }
+  return null;
+}
+
+function readUInt24LE(buffer: Buffer, offset: number) {
+  return buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+}
+
+/**
+ * @description 解析 JPEG 的 SOF 段获取实际宽高。
+ * @param buffer 图片数据。
+ * @returns 图片宽高。
+ */
+function getJpegSize(buffer: Buffer): { width: number, height: number } | null {
+  let offset = 2;
+  while (offset + 9 < buffer.length) {
+    if (buffer[offset] !== 0xFF) {
+      offset++;
+      continue;
+    }
+    const marker = buffer[offset + 1];
+    if (marker >= 0xC0 && marker <= 0xCF && ![0xC4, 0xC8, 0xCC].includes(marker)) {
+      return { height: buffer.readUInt16BE(offset + 5), width: buffer.readUInt16BE(offset + 7) };
+    }
+    const length = buffer.readUInt16BE(offset + 2);
+    if (length < 2) break;
+    offset += 2 + length;
+  }
+  return null;
+}
+
+/**
+ * @description 解析 WebP 的 VP8X / VP8 / VP8L 段获取实际宽高。
+ * @param buffer 图片数据。
+ * @returns 图片宽高。
+ */
+function getWebpSize(buffer: Buffer): { width: number, height: number } | null {
+  const chunk = buffer.toString('ascii', 12, 16);
+  if (chunk === 'VP8X') {
+    return { width: 1 + readUInt24LE(buffer, 24), height: 1 + readUInt24LE(buffer, 27) };
+  }
+  if (chunk === 'VP8 ') {
+    return { width: buffer.readUInt16LE(26) & 0x3FFF, height: buffer.readUInt16LE(28) & 0x3FFF };
+  }
+  if (chunk === 'VP8L') {
+    const b0 = buffer[21], b1 = buffer[22], b2 = buffer[23], b3 = buffer[24];
+    return { width: 1 + (b0 | ((b1 & 0x3F) << 8)), height: 1 + ((b1 >> 6) | (b2 << 2) | ((b3 & 0x0F) << 10)) };
+  }
+  return null;
+}
+
+/**
+ * @description 读取图片实际宽高（PNG / JPEG / GIF / WebP）。
+ * @param buffer 图片数据。
+ * @returns 图片宽高，无法识别时返回 null。
+ */
+function getImageSize(buffer: Buffer): { width: number, height: number } | null {
+  const type = detectImageType(buffer);
+  if (!type) return null;
+  if (type.ext === '.png') return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  if (type.ext === '.gif') return { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+  if (type.ext === '.jpg') return getJpegSize(buffer);
+  if (type.ext === '.webp') return getWebpSize(buffer);
+  return null;
+}
+
+/**
+ * @description 从图片 URL 读取尺寸（用于 S3 本地读取失败但公网可访问的情况）。
+ * @param session 当前会话。
+ * @param url 图片链接。
+ * @returns 图片宽高，失败时返回 null。
+ */
+async function getImageSizeFromUrl(session: Session, url: string): Promise<{ width: number, height: number } | null> {
+  if (!url.startsWith('http')) return null;
+  try {
+    const data = await session.bot.ctx.http.get(url, { responseType: 'arraybuffer', timeout: 15000 });
+    return getImageSize(Buffer.from(data));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * @description 将图片上传到 QQ 官方机器人素材库，获得可在 Markdown 中引用的链接。
  * @param session 当前会话。
  * @param buffer 图片数据。
- * @param fileName 文件名（扩展名需与图片格式一致）。
+ * @param fileName 文件名。
  * @returns Markdown 引用链接，失败时返回 null。
  */
 async function uploadQQImage(session: Session, buffer: Buffer, fileName: string): Promise<string | null> {
-  const contentType = qqImageTypes[path.extname(fileName).toLowerCase()];
-  if (!contentType || buffer.length > 10 * 1024 * 1024) return null;
-  const cached = qqImageCache.get(`${session.bot.selfId}:${fileName}`);
+  if (buffer.length > 10 * 1024 * 1024) return null;
+  const detected = detectImageType(buffer);
+  const contentType = detected?.mime ?? qqImageTypes[path.extname(fileName).toLowerCase()];
+  if (!contentType) return null;
+  const uploadName = detected ? `${path.basename(fileName, path.extname(fileName))}${detected.ext}` : fileName;
+  const cacheKey = `${session.bot.selfId}:${fileName}`;
+  const cached = qqImageCache.get(cacheKey);
   if (cached) return cached;
   const bot = session.bot as any;
   const request = bot.internal.http();
@@ -166,7 +268,7 @@ async function uploadQQImage(session: Session, buffer: Buffer, fileName: string)
   const sha1 = crypto.createHash('sha1').update(buffer).digest('hex');
   const prepared = await request('/v2/media-images/prepare', {
     method: 'POST',
-    data: { file_name: fileName, file_size: buffer.length, content_type: contentType, md5, sha1 },
+    data: { file_name: uploadName, file_size: buffer.length, content_type: contentType, md5, sha1 },
   });
   await bot.ctx.http.put(prepared.presigned_url, buffer, { headers: { 'Content-Type': contentType } });
   const completed = await request('/v2/media-images/complete', {
@@ -174,22 +276,8 @@ async function uploadQQImage(session: Session, buffer: Buffer, fileName: string)
     data: { upload_id: prepared.upload_id, md5 },
   });
   if (!completed?.url) return null;
-  qqImageCache.set(`${session.bot.selfId}:${fileName}`, completed.url);
+  qqImageCache.set(cacheKey, completed.url);
   return completed.url;
-}
-
-/**
- * @description 读取图片尺寸，失败时返回 null（Markdown 中可省略尺寸）。
- * @param buffer 图片数据。
- * @returns 图片宽高。
- */
-async function getImageSize(buffer: Buffer): Promise<{ width: number, height: number } | null> {
-  try {
-    const image = await Jimp.read(buffer);
-    return { width: image.bitmap.width, height: image.bitmap.height };
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -225,7 +313,9 @@ async function buildQQCaveMarkdown(cave: CaveObject, config: Config, fileManager
       }
       let url: string | null = null;
       if (config.enableS3 && config.publicUrl) {
-        url = new URL(fileName, config.publicUrl).href;
+        // 确保以 / 结尾，避免 new URL 相对路径解析时丢掉最后一级路径
+        const base = config.publicUrl.endsWith('/') ? config.publicUrl : `${config.publicUrl}/`;
+        url = new URL(fileName, base).href;
       } else if (buffer) {
         try {
           url = await uploadQQImage(session, buffer, fileName);
@@ -237,8 +327,14 @@ async function buildQQCaveMarkdown(cave: CaveObject, config: Config, fileManager
         lines.push('[图片]');
         continue;
       }
-      const size = buffer ? await getImageSize(buffer) : null;
-      lines.push(size ? `![img #${size.width}px #${size.height}px](${url})` : `![img](${url})`);
+      const size = buffer ? getImageSize(buffer) : await getImageSizeFromUrl(session, url);
+      // QQ Markdown 图片必须带实际宽高，移动端才不会显示为占位文本
+      if (!size) {
+        logger.warn(`无法获取图片 ${fileName} 的尺寸，QQ 端将显示为 [图片]`);
+        lines.push('[图片]');
+        continue;
+      }
+      lines.push(`![img #${size.width}px #${size.height}px](${url})`);
     } else if (el.type === 'video') {
       lines.push('[视频]');
     } else if (el.type === 'audio') {
